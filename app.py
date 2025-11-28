@@ -309,102 +309,219 @@ class HandTracker(VideoTransformerBase):
             st.session_state.last_test_results['risk_assessment'] = risk_assessment
             st.session_state.test_in_progress = False
             st.rerun()
-
 def show_tremor_test():
     """Display the tremor test interface with real-time camera feed."""
     st.title("Tremor Test")
     st.markdown("""
-    This test analyzes hand tremors, a common symptom of Parkinson's disease. 
-    Follow the instructions below to complete the test.
+    Follow these instructions to complete the tremor test:
+    1. Position your hand in front of the camera
+    2. Keep your hand steady for 10 seconds
+    3. The system will analyze your hand movements for tremors
     """)
     
-    # Test instructions
-    with st.expander("📋 Instructions", expanded=True):
-        st.markdown("""
-        1. Position your hand in front of your device's camera.
-        2. Keep your hand steady with fingers slightly spread.
-        3. Click 'Start Test' and hold the position for 10 seconds.
-        4. Try to keep your hand as still as possible.
-        5. The system will analyze any tremors in your hand movements.
-        """)
-    
-    # Initialize session state for test status
+    # Initialize test state if not exists
+    if 'test_start_time' not in st.session_state:
+        st.session_state.test_start_time = None
     if 'test_in_progress' not in st.session_state:
         st.session_state.test_in_progress = False
+    if 'landmarks_data' not in st.session_state:
+        st.session_state.landmarks_data = []
+    if 'camera_device' not in st.session_state:
+        st.session_state.camera_device = 0  # Default camera
     
-    # Start/Stop test buttons
+    # Camera selection
+    st.sidebar.subheader("Camera Settings")
+    camera_options = ["Front Camera", "Back Camera"]  # You can add more options if needed
+    selected_camera = st.sidebar.radio("Select Camera", camera_options, index=st.session_state.camera_device)
+    st.session_state.camera_device = 0 if selected_camera == "Front Camera" else 1
+    
+    # Test controls
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("🎥 Start Test", disabled=st.session_state.test_in_progress):
+        if st.button("🎥 Start Test", disabled=st.session_state.test_in_progress, 
+                    help="Click to start the tremor test"):
+            st.session_state.test_start_time = time.time()
             st.session_state.test_in_progress = True
             st.session_state.landmarks_data = []
+            st.rerun()
+    
+    with col2:
+        if st.button("⏹️ Stop Test", disabled=not st.session_state.test_in_progress,
+                    type="primary"):
+            st.session_state.test_in_progress = False
             st.session_state.test_start_time = None
             st.rerun()
     
-    # Camera feed and test display
-    if st.session_state.test_in_progress:
-        # Initialize test start time if not set
-        if 'test_start_time' not in st.session_state:
-            st.session_state.test_start_time = time.time()
-        
-        # Calculate test duration
-        test_duration = time.time() - st.session_state.test_start_time
-        
-        # Show progress
-        progress = min(test_duration / 10, 1.0)
-        st.progress(progress)
-        st.info(f"Test in progress: {min(int(test_duration), 10)}/10 seconds")
-        
-        # Display the camera feed with hand tracking
-        ctx = webrtc_streamer(
-            key="tremor-test",
-            video_processor_factory=HandTracker,
-            rtc_configuration=RTCConfiguration(
-                {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-            ),
-            media_stream_constraints={"video": True, "audio": False},
-            async_processing=True,
-        )
-        
-        # Check if test duration is complete
-        if test_duration >= 10 and 'last_test_results' not in st.session_state:
+    # Show test status and handle timing
+    if st.session_state.test_in_progress and st.session_state.test_start_time is not None:
+        try:
+            current_time = time.time()
+            test_duration = current_time - st.session_state.test_start_time
+            remaining_time = max(0, 10 - test_duration)
+            
+            # Update progress bar
+            progress = min(1.0, test_duration / 10.0)
+            st.progress(progress)
+            st.write(f"⏱️ Time remaining: {remaining_time:.1f} seconds")
+            
+            # Check if test is complete
+            if test_duration >= 10:
+                st.session_state.test_in_progress = False
+                st.rerun()
+                
+        except Exception as e:
+            st.error(f"Error in test timing: {str(e)}")
             st.session_state.test_in_progress = False
-            st.rerun()
-        
-        # Add a stop button
-        if st.button("🛑 Stop Test"):
-            st.session_state.test_in_progress = False
+            st.session_state.test_start_time = None
             st.rerun()
     
-    # Display results if available
-    if 'last_test_results' in st.session_state and st.session_state.last_test_results['type'] == 'tremor':
-        results = st.session_state.last_test_results['results']
-        risk = st.session_state.last_test_results.get('risk_assessment', {'risk_category': 'N/A'})
+    # Display camera feed only when test is in progress
+    if st.session_state.test_in_progress:
+        st.info("🔴 Camera is active - Position your hand in the frame")
         
-        st.subheader("Test Results")
+        # Use OpenCV to access the camera
+        cap = cv2.VideoCapture(st.session_state.camera_device)
         
-        # Create columns for metrics
-        col1, col2, col3 = st.columns(3)
+        if not cap.isOpened():
+            st.error("Error: Could not open camera. Please check your camera settings.")
+            st.session_state.test_in_progress = False
+            st.session_state.test_start_time = None
+            return
         
-        with col1:
-            st.metric("Tremor Score", f"{results.get('tremor_score', 0)*100:.1f}%")
-        with col2:
-            st.metric("Severity", results.get('severity', 'N/A'))
-        with col3:
-            st.metric("Risk Level", risk.get('risk_category', 'N/A'))
+        # Create a placeholder for the video feed
+        video_placeholder = st.empty()
+        hand_tracker = HandTracker()
         
-        # Show tremor analysis visualization if available
-        if visualizer:
-            st.plotly_chart(visualizer.plot_tremor_analysis(results), use_container_width=True)
-        
-        # Show risk assessment
-        st.subheader("Risk Assessment")
-        st.markdown(f"**{risk['risk_category']} Risk**")
-        st.progress(risk['overall_risk_score'])
-        st.markdown(risk['explanation'])
-        st.markdown(f"**Recommendation:** {risk['recommendation']}")
+        try:
+            while st.session_state.test_in_progress and st.session_state.test_start_time is not None:
+                ret, frame = cap.read()
+                if not ret:
+                    st.error("Failed to capture frame from camera")
+                    break
+                
+                # Process frame with hand tracker
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Create a frame object that the transform method expects
+                class Frame:
+                    def __init__(self, img):
+                        self.img = img
+                    def to_ndarray(self, format="bgr24"):
+                        if format == "bgr24":  
+                            return cv2.cvtColor(self.img, cv2.COLOR_RGB2BGR)
+                        return self.img
+                
+                # Process the frame through the hand tracker
+                frame_obj = Frame(frame_rgb)
+                processed_frame = hand_tracker.transform(frame_obj)
+                results = hand_tracker.hands.process(cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB))
+                
+                # Draw landmarks if available
+                if results and results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        # Draw hand landmarks
+                        mp.solutions.drawing_utils.draw_landmarks(
+                            frame_rgb,
+                            hand_landmarks,
+                            mp.solutions.hands.HAND_CONNECTIONS
+                        )
+                        st.session_state.landmarks_data.append(hand_landmarks)
+                
+                # Display the frame
+                video_placeholder.image(frame_rgb, channels="RGB", use_column_width=True)
+                
+                # Check test duration
+                if time.time() - st.session_state.test_start_time >= 10:
+                    st.session_state.test_in_progress = False
+                    break
+                    
+                # Small delay to control frame rate
+                time.sleep(0.05)
+                
+        except Exception as e:
+            st.error(f"Error in camera feed: {str(e)}")
+            import traceback
+            st.text(traceback.format_exc())
+            
+        finally:
+            cap.release()
+            video_placeholder.empty()
+            
+            # If we have data, analyze it
+            if 'landmarks_data' in st.session_state and st.session_state.landmarks_data and not st.session_state.test_in_progress:
+                show_tremor_results()
+    
+    # Show results if we have them
+    if 'tremor_results' in st.session_state and not st.session_state.test_in_progress:
+        show_tremor_results()
 
+def show_tremor_results():
+    """Display the results of the tremor test."""
+    st.success("✅ Test completed! Analyzing results...")
+    
+    # Convert landmarks to numpy array for analysis
+    landmarks_array = []
+    for landmarks in st.session_state.landmarks_data:
+        frame_landmarks = []
+        for landmark in landmarks.landmark:
+            frame_landmarks.append([landmark.x, landmark.y, landmark.z])
+        landmarks_array.append(frame_landmarks)
+    
+    if landmarks_array:
+        try:
+            # Analyze tremor
+            analyzer = TremorAnalyzer()
+            features = analyzer.calculate_tremor_features(np.array(landmarks_array))
+            severity = analyzer.analyze_tremor_severity(features)
+            
+            # Display results
+            st.subheader("📊 Test Results")
+            
+            # Show severity with color coding
+            severity_level = severity['severity']
+            if severity_level == "Severe":
+                st.error(f"**Severity:** {severity_level} (Score: {severity['tremor_score']:.2f})")
+            elif severity_level == "Moderate":
+                st.warning(f"**Severity:** {severity_level} (Score: {severity['tremor_score']:.2f})")
+            else:
+                st.success(f"**Severity:** {severity_level} (Score: {severity['tremor_score']:.2f})")
+            
+            # Save results
+            result = {
+                'tremor_score': float(severity['tremor_score']),
+                'severity': severity_level,
+                'test_duration': 10.0,
+                'parameters': {
+                    'test_type': 'tremor',
+                    'duration_seconds': 10
+                }
+            }
+            
+            # Save to database
+            save_result = data_handler.save_test_results(
+                st.session_state.user_id,
+                'tremor',
+                result
+            )
+            
+            if save_result:
+                st.success("📝 Results saved successfully!")
+            else:
+                st.warning("⚠️ Could not save results to the database.")
+            
+        except Exception as e:
+            st.error(f"❌ Error analyzing tremor: {str(e)}")
+            st.error("Please try the test again.")
+            import traceback
+            st.text(traceback.format_exc())
+    
+    # Clean up
+    if 'landmarks_data' in st.session_state:
+        del st.session_state.landmarks_data
+    if 'tremor_results' in st.session_state:
+        del st.session_state.tremor_results
+             
 def show_tap_test():
     """Display the finger tap test interface."""
     st.title("Finger Tap Test")
