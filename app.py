@@ -5,10 +5,13 @@ import json
 import numpy as np
 import pandas as pd
 import streamlit as st
+import cv2
 from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
+import mediapipe as mp
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
 
 # Add the utils directory to the Python path
 sys.path.append(str(Path(__file__).parent))
@@ -29,14 +32,12 @@ st.set_page_config(
 )
 
 # Initialize session state
-if 'user_id' not in st.session_state:
-    st.session_state.user_id = f"user_{int(time.time())}"
-    
-if 'test_in_progress' not in st.session_state:
-    st.session_state.test_in_progress = False
-    
 if 'current_page' not in st.session_state:
-    st.session_state.current_page = 'Dashboard'
+    st.session_state.current_page = "Dashboard"
+    st.session_state.user_id = f"user_{int(time.time())}"
+    st.session_state.test_in_progress = False
+    st.session_state.landmarks_data = []
+    st.session_state.test_start_time = None
 
 # Initialize data handler
 data_handler = DataHandler()
@@ -137,8 +138,13 @@ def show_dashboard():
     with col3:
         st.metric("Average Risk Score", f"{avg_risk*100:.1f}%" if avg_risk > 0 else "N/A")
     with col4:
-        st.metric("Risk Category", f"<span class='risk-{risk_class}'>{risk_category}</span>" if risk_class else "N/A", 
-                 unsafe_allow_html=True)
+        st.markdown("**Risk Category**")
+        if risk_class:
+            color = "#ff4b4b" if risk_class == "high" else "#ffa500" if risk_class == "moderate" else "#2ecc71"
+            st.markdown(f"<div style='color: {color}; font-size: 1.5rem; font-weight: bold;'>{risk_category}</div>", 
+                      unsafe_allow_html=True)
+        else:
+            st.markdown("N/A")
     
     # Show recent tests
     if not user_history.empty:
@@ -170,8 +176,142 @@ def show_dashboard():
     else:
         st.info("No test history found. Complete a test to see your results here.")
 
+class HandTracker(VideoTransformerBase):
+    def __init__(self):
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.landmarks_data = []
+        self.test_start_time = None
+        self.test_duration = 10  # seconds
+
+    def transform(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Process the frame and detect hands
+        results = self.hands.process(img_rgb)
+        
+        # Draw hand landmarks
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                # Draw landmarks
+                mp.solutions.drawing_utils.draw_landmarks(
+                    img, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
+                
+                # Store landmarks data for analysis
+                landmarks = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark])
+                self.landmarks_data.append(landmarks)
+                
+                # Start test timer if not already started
+                if self.test_start_time is None:
+                    self.test_start_time = time.time()
+                
+                # Check if test duration is complete
+                if time.time() - self.test_start_time >= self.test_duration:
+                    self.analyze_tremor()
+                    return img
+        
+        # Add timer display
+        if self.test_start_time is not None:
+            elapsed = time.time() - self.test_start_time
+            remaining = max(0, self.test_duration - elapsed)
+            cv2.putText(img, f"Time: {remaining:.1f}s", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        
+        return img
+    
+    def analyze_tremor(self):
+        if len(self.landmarks_data) > 10:  # Ensure we have enough data
+            try:
+                landmarks_array = np.array(self.landmarks_data)
+                tremor_analyzer = TremorAnalyzer()
+                tremor_features = tremor_analyzer.calculate_tremor_features(landmarks_array)
+                tremor_analysis = tremor_analyzer.analyze_tremor_severity(tremor_features)
+                
+                # Calculate test duration
+                test_duration = time.time() - self.test_start_time
+                
+                # Calculate risk score
+                test_results = {
+                    'tremor': tremor_analysis,
+                    'test_duration': test_duration,
+                    'parameters': {
+                        'sampling_rate': 30,
+                        'window_size': 100,
+                        'overlap': 0.5
+                    },
+                    'raw_data': landmarks_array
+                }
+                
+                risk_calculator = RiskCalculator()
+                risk_assessment = risk_calculator.calculate_risk(test_results)
+                
+                # Save to history
+                data_handler.save_test_results(
+                    st.session_state.user_id,
+                    'tremor',
+                    {
+                        **tremor_analysis,
+                        'test_duration': test_duration,
+                        'risk_score': risk_assessment['overall_risk_score']
+                    }
+                )
+                
+                # Save results to session state
+                st.session_state.landmarks_data = self.landmarks_data
+                st.session_state.last_test_results = {
+                    'type': 'tremor',
+                    'results': tremor_analysis,
+                    'test_duration': test_duration,
+                    'timestamp': datetime.now().isoformat(),
+                    'risk_assessment': risk_assessment
+                }
+                
+                # Force UI update
+                st.session_state.test_in_progress = False
+                st.rerun()
+                
+            except Exception as e:
+                st.error(f"Error analyzing tremor: {str(e)}")
+                st.session_state.test_in_progress = False
+                st.rerun()
+            
+            # Calculate risk score
+            test_results = {
+                'tremor': tremor_analysis,
+                'test_duration': test_duration,
+                'parameters': {
+                    'sampling_rate': 30,
+                    'window_size': 100,
+                    'overlap': 0.5
+                },
+                'raw_data': landmarks_array
+            }
+            
+            risk_calculator = RiskCalculator()
+            risk_assessment = risk_calculator.calculate_risk(test_results)
+            
+            # Save to history
+            data_handler.save_test_results(
+                st.session_state.user_id,
+                'tremor',
+                {
+                    **tremor_analysis,
+                    'test_duration': test_duration,
+                    'risk_score': risk_assessment['overall_risk_score']
+                }
+            )
+            
+            st.session_state.last_test_results['risk_assessment'] = risk_assessment
+            st.session_state.test_in_progress = False
+            st.rerun()
+
 def show_tremor_test():
-    """Display the tremor test interface."""
+    """Display the tremor test interface with real-time camera feed."""
     st.title("Tremor Test")
     st.markdown("""
     This test analyzes hand tremors, a common symptom of Parkinson's disease. 
@@ -188,79 +328,59 @@ def show_tremor_test():
         5. The system will analyze any tremors in your hand movements.
         """)
     
-    # Test controls
+    # Initialize session state for test status
+    if 'test_in_progress' not in st.session_state:
+        st.session_state.test_in_progress = False
+    
+    # Start/Stop test buttons
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("🎥 Start Camera"):
+        if st.button("🎥 Start Test", disabled=st.session_state.test_in_progress):
             st.session_state.test_in_progress = True
-            st.session_state.tremor_test_start = time.time()
-            
-    with col2:
-        if st.button("🛑 Stop Test", disabled=not st.session_state.get('test_in_progress', False)):
-            st.session_state.test_in_progress = False
-            
-            # Simulate test results (in a real app, this would come from the camera feed analysis)
-            test_duration = time.time() - st.session_state.tremor_test_start
-            
-            # Generate sample tremor data
-            tremor_analyzer = TremorAnalyzer()
-            sample_data = np.random.randn(300, 21, 3) * 0.1  # Simulated hand landmarks
-            tremor_features = tremor_analyzer.calculate_tremor_features(sample_data)
-            tremor_analysis = tremor_analyzer.analyze_tremor_severity(tremor_features)
-            
-            # Save results
-            test_results = {
-                'tremor': tremor_analysis,
-                'test_duration': test_duration,
-                'parameters': {
-                    'sampling_rate': 30,
-                    'window_size': 100,
-                    'overlap': 0.5
-                },
-                'raw_data_path': f"tremor_test_{int(time.time())}.npy"
-            }
-            
-            # Calculate risk score
-            risk_calculator = RiskCalculator()
-            risk_assessment = risk_calculator.calculate_risk(test_results)
-            
-            # Save to history
-            data_handler.save_test_results(
-                st.session_state.user_id,
-                'tremor',
-                {
-                    **tremor_analysis,
-                    'test_duration': test_duration,
-                    'risk_score': risk_assessment['overall_risk_score']
-                }
-            )
-            
-            st.session_state.last_test_results = {
-                'type': 'tremor',
-                'results': tremor_analysis,
-                'risk_assessment': risk_assessment,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            st.experimental_rerun()
+            st.session_state.landmarks_data = []
+            st.session_state.test_start_time = None
+            st.rerun()
     
-    # Display test status
-    if st.session_state.get('test_in_progress', False):
-        test_duration = time.time() - st.session_state.tremor_test_start
-        progress = min(test_duration / 10, 1.0)  # 10-second test
+    # Camera feed and test display
+    if st.session_state.test_in_progress:
+        # Initialize test start time if not set
+        if 'test_start_time' not in st.session_state:
+            st.session_state.test_start_time = time.time()
         
+        # Calculate test duration
+        test_duration = time.time() - st.session_state.test_start_time
+        
+        # Show progress
+        progress = min(test_duration / 10, 1.0)
         st.progress(progress)
         st.info(f"Test in progress: {min(int(test_duration), 10)}/10 seconds")
         
-        if test_duration >= 10:
+        # Display the camera feed with hand tracking
+        ctx = webrtc_streamer(
+            key="tremor-test",
+            video_processor_factory=HandTracker,
+            rtc_configuration=RTCConfiguration(
+                {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+            ),
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+        
+        # Check if test duration is complete
+        if test_duration >= 10 and 'last_test_results' not in st.session_state:
             st.session_state.test_in_progress = False
-            st.experimental_rerun()
+            st.rerun()
+        
+        # Add a stop button
+        if st.button("🛑 Stop Test"):
+            st.session_state.test_in_progress = False
+            st.rerun()
     
     # Display results if available
     if 'last_test_results' in st.session_state and st.session_state.last_test_results['type'] == 'tremor':
         results = st.session_state.last_test_results['results']
-        risk = st.session_state.last_test_results['risk_assessment']
+        risk = st.session_state.last_test_results.get('risk_assessment', {'risk_category': 'N/A'})
         
         st.subheader("Test Results")
         
@@ -268,14 +388,15 @@ def show_tremor_test():
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.metric("Tremor Score", f"{results['tremor_score']*100:.1f}%")
+            st.metric("Tremor Score", f"{results.get('tremor_score', 0)*100:.1f}%")
         with col2:
-            st.metric("Severity", results['severity'])
+            st.metric("Severity", results.get('severity', 'N/A'))
         with col3:
-            st.metric("Risk Level", risk['risk_category'])
+            st.metric("Risk Level", risk.get('risk_category', 'N/A'))
         
-        # Show tremor analysis visualization
-        st.plotly_chart(visualizer.plot_tremor_analysis(results), use_container_width=True)
+        # Show tremor analysis visualization if available
+        if visualizer:
+            st.plotly_chart(visualizer.plot_tremor_analysis(results), use_container_width=True)
         
         # Show risk assessment
         st.subheader("Risk Assessment")
@@ -365,7 +486,7 @@ def show_tap_test():
             st.metric("Tap Count", st.session_state.tap_count)
         else:
             st.session_state.test_in_progress = False
-            st.experimental_rerun()
+            st.rerun()
     
     # Display results if available
     if 'last_test_results' in st.session_state and st.session_state.last_test_results['type'] == 'tap':
